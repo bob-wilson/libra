@@ -31,13 +31,13 @@ use diem_types::{
 use fail::fail_point;
 use move_core_types::{
     account_address::AccountAddress,
-    gas_schedule::{CostTable, GasAlgebra, GasCarrier, GasUnits},
+    gas_schedule::GasAlgebra,
     identifier::IdentStr,
     transaction_argument::convert_txn_args,
     value::{serialize_values, MoveValue},
 };
 use move_vm_runtime::{data_cache::RemoteCache, logging::LogContext, session::Session};
-use move_vm_types::gas_schedule::{zero_cost_schedule, CostStrategy};
+use move_vm_types::gas_schedule::CostStrategy;
 use rayon::prelude::*;
 use std::{
     collections::HashSet,
@@ -60,8 +60,7 @@ impl DiemVM {
     pub fn failed_transaction_cleanup(
         &self,
         error_code: VMStatus,
-        gas_schedule: &CostTable,
-        gas_left: GasUnits<GasCarrier>,
+        cost_strategy: &mut CostStrategy,
         txn_data: &TransactionMetadata,
         remote_cache: &StateViewCache<'_>,
         account_currency_symbol: &IdentStr,
@@ -69,8 +68,7 @@ impl DiemVM {
     ) -> TransactionOutput {
         self.failed_transaction_cleanup_and_keep_vm_status(
             error_code,
-            gas_schedule,
-            gas_left,
+            cost_strategy,
             txn_data,
             remote_cache,
             account_currency_symbol,
@@ -82,14 +80,13 @@ impl DiemVM {
     fn failed_transaction_cleanup_and_keep_vm_status(
         &self,
         error_code: VMStatus,
-        gas_schedule: &CostTable,
-        gas_left: GasUnits<GasCarrier>,
+        cost_strategy: &mut CostStrategy,
         txn_data: &TransactionMetadata,
         remote_cache: &StateViewCache<'_>,
         account_currency_symbol: &IdentStr,
         log_context: &impl LogContext,
     ) -> (VMStatus, TransactionOutput) {
-        let mut cost_strategy = CostStrategy::system(gas_schedule, gas_left);
+        cost_strategy.disable_metering();
         let mut session = self.0.new_session(remote_cache);
         match TransactionStatus::from(error_code.clone()) {
             TransactionStatus::Keep(status) => {
@@ -101,16 +98,21 @@ impl DiemVM {
                 // discard the transaction.
                 if let Err(e) = self.0.run_failure_epilogue(
                     &mut session,
-                    &mut cost_strategy,
+                    cost_strategy,
                     txn_data,
                     account_currency_symbol,
                     log_context,
                 ) {
                     return discard_error_vm_status(e);
                 }
-                let txn_output =
-                    get_transaction_output(&mut (), session, &cost_strategy, txn_data, status)
-                        .unwrap_or_else(|e| discard_error_vm_status(e).1);
+                let txn_output = get_transaction_output(
+                    &mut (),
+                    session,
+                    cost_strategy.remaining_gas(),
+                    txn_data,
+                    status,
+                )
+                .unwrap_or_else(|e| discard_error_vm_status(e).1);
                 (error_code, txn_output)
             }
             TransactionStatus::Discard(status) => {
@@ -123,16 +125,15 @@ impl DiemVM {
     fn success_transaction_cleanup<R: RemoteCache>(
         &self,
         mut session: Session<R>,
-        gas_schedule: &CostTable,
-        gas_left: GasUnits<GasCarrier>,
+        cost_strategy: &mut CostStrategy,
         txn_data: &TransactionMetadata,
         account_currency_symbol: &IdentStr,
         log_context: &impl LogContext,
     ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        let mut cost_strategy = CostStrategy::system(gas_schedule, gas_left);
+        cost_strategy.disable_metering();
         self.0.run_success_epilogue(
             &mut session,
-            &mut cost_strategy,
+            cost_strategy,
             txn_data,
             account_currency_symbol,
             log_context,
@@ -143,7 +144,7 @@ impl DiemVM {
             get_transaction_output(
                 &mut (),
                 session,
-                &cost_strategy,
+                cost_strategy.remaining_gas(),
                 txn_data,
                 KeptVMStatus::Executed,
             )?,
@@ -165,8 +166,6 @@ impl DiemVM {
             ))
         });
 
-        let gas_schedule = self.0.get_gas_schedule(log_context)?;
-
         // Run the execution logic
         {
             cost_strategy
@@ -185,11 +184,9 @@ impl DiemVM {
 
             charge_global_write_gas_usage(cost_strategy, &session, &txn_data.sender())?;
 
-            cost_strategy.disable_metering();
             self.success_transaction_cleanup(
                 session,
-                gas_schedule,
-                cost_strategy.remaining_gas(),
+                cost_strategy,
                 txn_data,
                 account_currency_symbol,
                 log_context,
@@ -211,8 +208,6 @@ impl DiemVM {
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
             ))
         });
-
-        let gas_schedule = self.0.get_gas_schedule(log_context)?;
 
         // Publish the module
         let module_address = if self.0.publishing_option(log_context)?.is_open_module() {
@@ -237,8 +232,7 @@ impl DiemVM {
 
         self.success_transaction_cleanup(
             session,
-            gas_schedule,
-            cost_strategy.remaining_gas(),
+            cost_strategy,
             txn_data,
             account_currency_symbol,
             log_context,
@@ -316,8 +310,7 @@ impl DiemVM {
                 } else {
                     self.failed_transaction_cleanup_and_keep_vm_status(
                         err,
-                        gas_schedule,
-                        cost_strategy.remaining_gas(),
+                        &mut cost_strategy,
                         &txn_data,
                         remote_cache,
                         &account_currency_symbol,
@@ -335,8 +328,7 @@ impl DiemVM {
         txn_sender: Option<AccountAddress>,
         log_context: &impl LogContext,
     ) -> Result<ChangeSet, Result<(VMStatus, TransactionOutput), VMStatus>> {
-        let gas_schedule = zero_cost_schedule();
-        let mut cost_strategy = CostStrategy::system(&gas_schedule, GasUnits::new(0));
+        let mut cost_strategy = CostStrategy::system();
 
         Ok(match writeset_payload {
             WriteSetPayload::Direct(change_set) => change_set.clone(),
@@ -423,8 +415,7 @@ impl DiemVM {
             sender: account_config::reserved_vm_address(),
             ..Default::default()
         };
-        let gas_schedule = zero_cost_schedule();
-        let mut cost_strategy = CostStrategy::system(&gas_schedule, GasUnits::new(0));
+        let mut cost_strategy = CostStrategy::system();
         let mut session = self.0.new_session(remote_cache);
 
         let (round, timestamp, previous_vote, proposer) = block_metadata.into_inner();
@@ -453,7 +444,7 @@ impl DiemVM {
         let output = get_transaction_output(
             &mut (),
             session,
-            &cost_strategy,
+            cost_strategy.remaining_gas(),
             &txn_data,
             KeptVMStatus::Executed,
         )?;

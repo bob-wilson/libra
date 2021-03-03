@@ -18,14 +18,12 @@ use diem_types::{
     vm_status::{StatusCode, VMStatus},
 };
 use move_core_types::{
-    gas_schedule::{GasAlgebra, GasUnits},
     identifier::{IdentStr, Identifier},
     move_resource::MoveResource,
 };
 use move_vm_runtime::{data_cache::RemoteCache, session::Session};
 
 use crate::logging::AdapterLogSchema;
-use move_vm_types::gas_schedule::CostStrategy;
 
 #[derive(Clone)]
 pub struct DiemVMValidator(DiemVMImpl);
@@ -147,28 +145,14 @@ pub(crate) fn validate_signature_checked_transaction<R: RemoteCache>(
 
     let txn_data = TransactionMetadata::new(transaction);
     let log_context = AdapterLogSchema::new(remote_cache.id(), 0);
-    let mut cost_strategy =
-        CostStrategy::system(vm.get_gas_schedule(&log_context)?, GasUnits::new(0));
     let prologue_status = match transaction.payload() {
         TransactionPayload::Script(_script) => {
             vm.check_gas(&txn_data, &log_context)?;
-            vm.run_script_prologue(
-                &mut session,
-                &mut cost_strategy,
-                &txn_data,
-                &currency_code,
-                &log_context,
-            )
+            vm.run_script_prologue(&mut session, &txn_data, &currency_code, &log_context)
         }
         TransactionPayload::Module(_module) => {
             vm.check_gas(&txn_data, &log_context)?;
-            vm.run_module_prologue(
-                &mut session,
-                &mut cost_strategy,
-                &txn_data,
-                &currency_code,
-                &log_context,
-            )
+            vm.run_module_prologue(&mut session, &txn_data, &currency_code, &log_context)
         }
         TransactionPayload::WriteSet(_cs) => {
             vm.run_writeset_prologue(&mut session, &txn_data, &log_context)
